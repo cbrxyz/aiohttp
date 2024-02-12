@@ -1,6 +1,7 @@
 import calendar
 import contextlib
 import datetime
+import heapq
 import itertools
 import os  # noqa
 import pathlib
@@ -10,7 +11,6 @@ import time
 import warnings
 from collections import defaultdict
 from http.cookies import BaseCookie, Morsel, SimpleCookie
-from math import ceil
 from typing import (
     DefaultDict,
     Dict,
@@ -73,6 +73,7 @@ class CookieJar(AbstractCookieJar):
         MAX_TIME = 2**31 - 1
     # Avoid minuses in the future, 3x faster
     SUB_MAX_TIME = MAX_TIME - 1
+    REMOVED_COOKIE = -1  # Marks a cookie as updated/replaced
 
     def __init__(
         self,
@@ -99,7 +100,10 @@ class CookieJar(AbstractCookieJar):
                 for url in treat_as_secure_origin
             ]
         self._treat_as_secure_origin = treat_as_secure_origin
-        self._next_expiration: float = ceil(time.time())
+        self._expiry_queue: List[List[float | Tuple[str, str, str]]] = []
+        self._queue_finder: Dict[
+            Tuple[str, str, str], List[float | Tuple[str, str, str]]
+        ] = {}
         self._expirations: Dict[Tuple[str, str, str], float] = {}
 
     def save(self, file_path: PathLike) -> None:
@@ -112,36 +116,31 @@ class CookieJar(AbstractCookieJar):
         with file_path.open(mode="rb") as f:
             self._cookies = pickle.load(f)
 
+    def _delete_morsels(self, morsels: list[Morsel[str]]) -> None:
+        for domain, path, name in morsels:
+            self._host_only_cookies.discard((domain, name))
+            key = (domain, path, name)
+            if key in self._expirations:
+                del self._expirations[(domain, path, name)]
+                del self._queue_finder[key]
+            self._cookies[(domain, path)].pop(name, None)
+
     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
         if predicate is None:
-            self._next_expiration = ceil(time.time())
             self._cookies.clear()
             self._host_only_cookies.clear()
             self._expirations.clear()
             return
 
         to_del = []
-        now = time.time()
+        self._do_expiration()
         for (domain, path), cookie in self._cookies.items():
             for name, morsel in cookie.items():
-                key = (domain, path, name)
-                if (
-                    key in self._expirations and self._expirations[key] <= now
-                ) or predicate(morsel):
-                    to_del.append(key)
+                if predicate(morsel):
+                    to_del.append((domain, path, name))
 
-        for domain, path, name in to_del:
-            self._host_only_cookies.discard((domain, name))
-            key = (domain, path, name)
-            if key in self._expirations:
-                del self._expirations[(domain, path, name)]
-            self._cookies[(domain, path)].pop(name, None)
-
-        self._next_expiration = (
-            min(*self._expirations.values(), self.SUB_MAX_TIME) + 1
-            if self._expirations
-            else self.MAX_TIME
-        )
+        if to_del:
+            self._delete_morsels(to_del)
 
     def clear_domain(self, domain: str) -> None:
         self.clear(lambda x: self._is_domain_match(domain, x["domain"]))
@@ -160,11 +159,25 @@ class CookieJar(AbstractCookieJar):
         return sum(len(cookie.values()) for cookie in self._cookies.values())
 
     def _do_expiration(self) -> None:
-        self.clear(lambda x: False)
+        to_del = []
+        now = time.time()
+        # new implementation
+        while self._expiry_queue and self._expiry_queue[0][0] <= now:
+            when, key = heapq.heappop(self._expiry_queue)
+            if key in self._expirations and self._expirations[key] <= now:
+                to_del.append(key)
+        if to_del:
+            self._delete_morsels(to_del)
 
     def _expire_cookie(self, when: float, domain: str, path: str, name: str) -> None:
-        self._next_expiration = min(self._next_expiration, when)
-        self._expirations[(domain, path, name)] = when
+        key = (domain, path, name)
+        if key in self._queue_finder:
+            entry = self._queue_finder.pop(key)
+            entry[-1] = -1
+        entry = [when, key]
+        self._expirations[key] = when
+        self._queue_finder[key] = entry
+        heapq.heappush(self._expiry_queue, entry)
 
     def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
         """Update cookies."""
